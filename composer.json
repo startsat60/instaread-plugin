@@ -1,0 +1,12 @@
+{
+  "name": "startsat60/instaread-plugin",
+  "description": "Vendor provided plugin for Wordpress",
+  "keywords": ["wordpress", "plugin"],
+  "homepage": "",
+  "license": "GPL-2.0+",
+  "type": "wordpress-plugin",
+  "minimum-stability": "dev",
+  "require": {
+    "php": ">=5.3.2"
+    }
+}
