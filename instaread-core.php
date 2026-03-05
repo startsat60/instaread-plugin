@@ -3,7 +3,7 @@
  * Plugin Name: Instaread Audio Player - startsat60
  * Plugin URI: https://instaread.co
  * Description: Instaread auto-injecting player with partner configuration and full server-side rendering (no DOMDocument parsing, safer string injection)
- * Version: 4.2.6
+ * Version: 4.2.8
  * Author: Instaread Team
  */
 
