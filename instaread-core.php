@@ -28,6 +28,7 @@ class InstareadPlayer {
     private $settings;
     private $partner_config;
     private $plugin_version;
+    private $footer_scripts = [];
 
     // Enable debug mode via constant or filter
     private function is_debug_enabled() {
@@ -59,6 +60,7 @@ class InstareadPlayer {
 
         // Footer fallback only logs; does not inject to avoid duplicates
         add_action('wp_footer',        [$this, 'maybe_inject_via_footer'], 999);
+        add_action('wp_footer',        [$this, 'output_footer_scripts'], 20);
 
         add_filter('auto_update_plugin', [$this, 'enable_auto_updates'], 10, 2);
 
@@ -338,27 +340,26 @@ class InstareadPlayer {
                 return $content;
             }
 
-            $mover = '';
             if (!empty($target_selector)) {
-                if ($debug_mode) $this->log("Target selector '{$target_selector}' not found in content. Adding JS mover.");
+                if ($debug_mode) $this->log("Target selector '{$target_selector}' not found in content. Adding deferred JS mover to footer.");
                 // Teleport the player to the correct DOM element (even outside the post body)
-                $mover = sprintf(
-                    '<script>(function(){var t=document.querySelector("%s"),s=document.currentScript.previousElementSibling;if(t&&s){' .
-                    'if("%s"==="before_element")t.parentNode.insertBefore(s,t);' .
-                    'else if("%s"==="after_element")t.parentNode.insertBefore(s,t.nextSibling);' .
-                    'else if("%s"==="prepend"||"%s"==="inside_first_child")t.insertBefore(s,t.firstChild);' .
+                // Deferred via 'load' event to avoid interfering with React/JS hydration
+                $this->footer_scripts[] = sprintf(
+                    '<script>(function(){var pos="%s";function move(){var t=document.querySelector("%s"),s=document.querySelector(".instaread-player-slot");if(t&&s){' .
+                    'if(pos==="before_element")t.parentNode.insertBefore(s,t);' .
+                    'else if(pos==="after_element")t.parentNode.insertBefore(s,t.nextSibling);' .
+                    'else if(pos==="prepend"||pos==="inside_first_child")t.insertBefore(s,t.firstChild);' .
                     'else t.appendChild(s);' .
-                    '}})();</script>',
-                    esc_js($target_selector),
-                    esc_js($insert_position), esc_js($insert_position), 
-                    esc_js($insert_position), esc_js($insert_position)
+                    '}}if(document.readyState==="complete"){move();}else{window.addEventListener("load",move);}})();</script>',
+                    esc_js($insert_position),
+                    esc_js($target_selector)
                 );
             }
-            
+
             if (in_array($insert_position, ['inside_first_child', 'prepend', 'before_element'], true)) {
-                return $player_html . $mover . $content;
+                return $player_html . $content;
             }
-            return $content . $player_html . $mover;
+            return $content . $player_html;
         }
 
         if (!isset($target_info['open_pos']) || $target_info['open_pos'] < 0 || $target_info['open_pos'] >= strlen($content)) {
@@ -630,32 +631,44 @@ class InstareadPlayer {
 
     private function render_single($publication, $type, $color, $slot_css) {
         $ir_version = floor(time() / 60) * 60000;
+        // Store script for footer output to avoid breaking React/JS-rendered content
+        $this->footer_scripts[] = sprintf(
+            '<script defer src="https://player.instaread.co/js/instaread.%s.js?version=%d"></script>',
+            esc_attr($publication),
+            $ir_version
+        );
         return sprintf(
             '<div class="instaread-player-slot" style="%s">
                 <instaread-player publication="%s" playertype="%s" color="%s"></instaread-player>
-                <script defer src="https://player.instaread.co/js/instaread.%s.js?version=%d"></script>
             </div>',
             esc_attr($slot_css),
             esc_html($publication),
             esc_html($type),
-            esc_html($color),
-            esc_html($publication),
-            $ir_version
+            esc_html($color)
         );
     }
-    
 
     private function render_playlist($publication, $height) {
+        // Store script for footer output to avoid breaking React/JS-rendered content
+        $this->footer_scripts[] = '<script type="module" src="https://instaread.co/js/v2/instaread.playlist.js" crossorigin="true"></script>';
         return sprintf(
             '<div class="instaread-player-slot" style="height:%s;min-height:%s;">
                 <instaread-player publication="%s" p_type="playlist" height="%s"></instaread-player>
-                <script type="module" src="https://instaread.co/js/v2/instaread.playlist.js" crossorigin="true"></script>
             </div>',
             esc_attr($height),
             esc_attr($height),
             esc_html($publication),
             esc_attr($height)
         );
+    }
+
+    public function output_footer_scripts() {
+        if (!empty($this->footer_scripts)) {
+            foreach ($this->footer_scripts as $script) {
+                echo $script . "\n";
+            }
+            $this->log('Output ' . count($this->footer_scripts) . ' script(s) in footer.');
+        }
     }
 
     public function sanitize_settings($in) {
