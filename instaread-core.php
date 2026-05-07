@@ -3,7 +3,7 @@
  * Plugin Name: Instaread Audio Player - startsat60
  * Plugin URI: https://instaread.co
  * Description: Instaread auto-injecting player with partner configuration and full server-side rendering (no DOMDocument parsing, safer string injection)
- * Version: 4.5.3
+ * Version: 4.5.7
  * Author: Instaread Team
  */
 
@@ -56,7 +56,7 @@ class InstareadPlayer {
      * never triggers a file read on every request like get_plugin_data() did.
      * IMPORTANT: Keep this in sync with the Version header above.
      */
-    const PLUGIN_VERSION = '4.5.3';
+    const PLUGIN_VERSION = '4.5.7';
 
     /**
      * Domain pattern used to exclude our scripts from all caching/optimization plugins.
@@ -77,6 +77,14 @@ class InstareadPlayer {
     const CACHE_CLEAR_LOCK_KEY = 'instaread_cache_clearing';
 
     private function is_debug_enabled() {
+        // Partner-level opt-out: when "force_disable_logs": true is set in the
+        // partner config, we suppress every $this->log() call regardless of
+        // WP_DEBUG / INSTAREAD_DEBUG / instaread_debug filter. Useful for
+        // partners who run WP_DEBUG=true site-wide for their own debugging
+        // and don't want our verbose lines polluting their debug.log.
+        if (!empty($this->partner_config['force_disable_logs'])) {
+            return false;
+        }
         return (defined('WP_DEBUG') && WP_DEBUG)
             || (defined('INSTAREAD_DEBUG') && INSTAREAD_DEBUG)
             || apply_filters('instaread_debug', false);
@@ -117,9 +125,17 @@ class InstareadPlayer {
         add_action('admin_init',         [$this, 'register_settings']);
         add_action('admin_menu',         [$this, 'add_settings_page']);
         add_action('wp_enqueue_scripts', [$this, 'enqueue_assets']);
+        add_action('wp_head',            [$this, 'emit_version_meta'], 1);
 
-        // Run very late so other plugins (Social Warfare etc.) have already modified content
-        add_filter('the_content',        [$this, 'inject_server_side_player'], PHP_INT_MAX - 1, 1);
+        // Run very late by default so other plugins (Social Warfare etc.) have already
+        // modified content. Some themes/plugins (e.g. content rebuilders running at very
+        // high priority) wipe late injections — partners can override via config:
+        //   "the_content_priority": 99
+        // Default 9999 keeps us late but below any plugin pinned to PHP_INT_MAX.
+        $the_content_priority = isset($this->partner_config['the_content_priority'])
+            ? (int) $this->partner_config['the_content_priority']
+            : (PHP_INT_MAX - 1);
+        add_filter('the_content',        [$this, 'inject_server_side_player'], $the_content_priority, 1);
 
         // Footer fallback — only logs, never injects, to avoid duplicates
         add_action('wp_footer',          [$this, 'maybe_inject_via_footer'], 999);
@@ -383,6 +399,24 @@ class InstareadPlayer {
                 $this->log('Cleared Autoptimize cache.');
             }
 
+            // --- Redis Object Cache (and any drop-in object cache: Memcached, etc.) ---
+            // Some hosts (Kinsta, WP Engine, manual setups) cache rendered HTML fragments,
+            // post content, and serialized objects in Redis via wp-content/object-cache.php.
+            // Stale entries can cause the new plugin's the_content output to be ignored on
+            // upgrade. Only runs when clear_page_cache_on_upgrade is true (opt-in) because
+            // a global object-cache flush briefly hits the DB until the cache rewarms.
+            if ($clear_page_cache && wp_using_ext_object_cache()) {
+                if (function_exists('wp_cache_flush')) {
+                    wp_cache_flush();
+                    $this->log('Flushed external object cache (Redis/Memcached) via wp_cache_flush().');
+                }
+                // Till Krüss "Redis Object Cache Pro" exposes a richer API; use it when present.
+                if (class_exists('RedisCachePro\\Plugin') && method_exists('RedisCachePro\\Plugin', 'flush')) {
+                    \RedisCachePro\Plugin::flush();
+                    $this->log('Flushed Redis Object Cache Pro.');
+                }
+            }
+
             // --- W3 Total Cache (minify only) ---
             if (function_exists('w3tc_flush_minify')) {
                 w3tc_flush_minify();
@@ -505,15 +539,45 @@ class InstareadPlayer {
             return;
         }
 
-        $old_version = get_option(self::VERSION_OPTION_KEY, '0');
+        // The in-memory plugin object was instantiated from the OLD code at the
+        // start of this request. WordPress has just replaced the files on disk,
+        // but PHP does not reload classes mid-request — so $this->plugin_version
+        // still reflects the pre-upgrade version. Re-read config.json from disk
+        // to get the new version string.
+        $old_version = $this->plugin_version;
+        $new_version = $this->read_version_from_disk();
+
+        update_option(self::VERSION_OPTION_KEY, $new_version);
 
         if ($action === 'install') {
-            set_transient('instaread_just_installed', $this->plugin_version, DAY_IN_SECONDS);
-            $this->send_telemetry('install', null, $this->plugin_version);
+            set_transient('instaread_just_installed', $new_version, DAY_IN_SECONDS);
+            $this->send_telemetry('install', null, $new_version);
         } else {
-            set_transient('instaread_just_updated', $this->plugin_version, DAY_IN_SECONDS);
-            $this->send_telemetry('update', $old_version, $this->plugin_version);
+            set_transient('instaread_just_updated', $new_version, DAY_IN_SECONDS);
+            $this->send_telemetry('update', $old_version, $new_version);
         }
+    }
+
+    /**
+     * Re-read the partner config.json from disk to get the freshly-installed
+     * version string. Used by upgrade telemetry, where the in-memory
+     * $this->plugin_version still reflects the pre-upgrade code.
+     * Falls back to $this->plugin_version if the file can't be read.
+     */
+    private function read_version_from_disk() {
+        $config_path = __DIR__ . '/config.json';
+        if (!file_exists($config_path)) {
+            return $this->plugin_version;
+        }
+        $raw = @file_get_contents($config_path);
+        if ($raw === false) {
+            return $this->plugin_version;
+        }
+        $data = json_decode($raw, true);
+        if (json_last_error() !== JSON_ERROR_NONE || empty($data['version'])) {
+            return $this->plugin_version;
+        }
+        return (string) $data['version'];
     }
 
     /**
@@ -697,11 +761,24 @@ class InstareadPlayer {
         $this->log('Auto-update result: ' . print_r($result, true));
         $this->log('Skin feedback: ' . print_r($skin->get_upgrade_messages(), true));
 
-        // Send telemetry email if install succeeded
-        if ($result) {
-            $old_version = get_option(self::VERSION_OPTION_KEY, $current_version);
-            $this->send_telemetry('update', $old_version, $remote_version);
+        // Send telemetry email only if install ACTUALLY succeeded.
+        // Plugin_Upgrader::install() returns either:
+        //   - true on success
+        //   - false on a generic failure (e.g. ZIP missing)
+        //   - WP_Error on a structured failure (file permissions, extraction
+        //     error, fs_unavailable, etc.)
+        // is_wp_error() is required because WP_Error objects are TRUTHY in PHP,
+        // so a bare `if ($result)` would report success for a failed upgrade.
+        if ($result === true) {
+            update_option(self::VERSION_OPTION_KEY, $remote_version);
+            $this->send_telemetry('update', $current_version, $remote_version);
             set_transient('instaread_just_updated', $remote_version, DAY_IN_SECONDS);
+        } else {
+            $error_msg = is_wp_error($result)
+                ? $result->get_error_code() . ': ' . $result->get_error_message()
+                : 'install() returned ' . var_export($result, true);
+            $this->log('Auto-update FAILED for ' . $partner_id . ' v' . $remote_version . ' — ' . $error_msg);
+            $this->send_telemetry('update_failed', $current_version, $remote_version);
         }
 
         delete_transient('instaread_force_update');
@@ -977,13 +1054,19 @@ class InstareadPlayer {
      * file itself is intentionally stable and changes only on major architectural updates.
      */
     private function get_inline_playerv3_script_tag() {
-        return '<script defer
+        $url = !empty($this->partner_config['player_loader_url'])
+            ? esc_url($this->partner_config['player_loader_url'])
+            : 'https://player.instaread.co/js/instaread.playerv3.js';
+        return sprintf(
+            '<script defer
                 data-cfasync="false"
                 data-no-optimize="1"
                 data-no-defer="1"
                 data-no-minify="1"
-                src="https://player.instaread.co/js/instaread.playerv3.js">
-            </script>';
+                src="%s">
+            </script>',
+            $url
+        );
     }
 
     /**
@@ -1011,9 +1094,12 @@ class InstareadPlayer {
         // of the publication-specific bundle. playerv3.js reads <instaread-player publication="...">
         // from the DOM and dynamically loads the publication bundle — no integrity risk on updates.
         if ($this->should_use_player_loader()) {
+            $loader_url = !empty($this->partner_config['player_loader_url'])
+                ? $this->partner_config['player_loader_url']
+                : 'https://player.instaread.co/js/instaread.playerv3.js';
             wp_enqueue_script(
                 'instaread-player-loader',
-                'https://player.instaread.co/js/instaread.playerv3.js',
+                $loader_url,
                 [],
                 null,
                 true
@@ -1021,7 +1107,7 @@ class InstareadPlayer {
             if (function_exists('wp_script_add_data')) {
                 wp_script_add_data('instaread-player-loader', 'strategy', 'defer');
             }
-            $this->log('Enqueued playerv3 loader script sitewide (use_player_loader enabled).');
+            $this->log('Enqueued player loader script sitewide: ' . $loader_url);
             return;
         }
 
@@ -1044,6 +1130,24 @@ class InstareadPlayer {
         }
 
         $this->log('Enqueued remote Instaread publisher script (sitewide / floating persistence).');
+    }
+
+    /**
+     * Emits a <meta> tag in <head> with plugin version + partner id on every front-end page.
+     * Lets us verify the deployed plugin version on any partner site without telemetry —
+     * just `curl <url> | grep instaread-version`. Useful when telemetry POSTs are blocked
+     * by host firewalls / security plugins.
+     */
+    public function emit_version_meta() {
+        if (is_admin()) {
+            return;
+        }
+        $partner_id = $this->partner_config['partner_id'] ?? 'default';
+        printf(
+            '<meta name="instaread-version" content="%s" data-partner="%s">' . "\n",
+            esc_attr($this->plugin_version),
+            esc_attr($partner_id)
+        );
     }
 
     public function enqueue_assets() {
@@ -1235,9 +1339,39 @@ class InstareadPlayer {
         if (empty($post)) return;
 
         $content = get_the_content();
-        if (strpos($content, 'instaread-player') === false) {
-            $this->log('Footer fallback: player not found in content (no injection performed to avoid duplicates).');
+        if (strpos($content, 'instaread-player') !== false) {
+            return;
         }
+
+        // Server-side the_content injection didn't run (theme bypassed the filter, content
+        // rebuilt by another plugin, etc.). Opt-in JS fallback: locate the configured target
+        // selector in the rendered DOM and prepend the player slot client-side.
+        if (empty($this->partner_config['enable_footer_js_fallback'])) {
+            $this->log('Footer fallback: player not found in content (footer JS fallback disabled in config).');
+            return;
+        }
+
+        $target = $this->partner_config['footer_js_fallback_selector'] ?? '.entry-content';
+        $publication = $this->get_resolved_publication();
+        $player_type = $this->partner_config['playerType'] ?? '';
+        $color       = $this->partner_config['color'] ?? '#59476b';
+        $slot_css    = $this->partner_config['slot_css'] ?? 'min-height:144px;';
+
+        $slot_html = sprintf(
+            '<div class="instaread-player-slot" data-instaread-version="%s" data-instaread-source="footer-js-fallback" style="%s"><instaread-player publication="%s" playertype="%s" color="%s"></instaread-player></div>',
+            esc_attr($this->plugin_version),
+            esc_attr($slot_css),
+            esc_html($publication),
+            esc_html($player_type),
+            esc_html($color)
+        );
+
+        printf(
+            '<script data-cfasync="false" data-no-optimize="1">(function(){var t=document.querySelector(%s);if(t&&!t.querySelector(".instaread-player-slot")){var d=document.createElement("div");d.innerHTML=%s;t.insertBefore(d.firstChild,t.firstChild);}})();</script>',
+            wp_json_encode($target),
+            wp_json_encode($slot_html)
+        );
+        $this->log('Footer fallback: injected client-side player into ' . $target);
     }
 
     private function inject_with_safe_string_manipulation($content, $player_html, $target_selector, $insert_position, $allow_fallback = true) {
@@ -1563,10 +1697,13 @@ class InstareadPlayer {
     }
 
     private function render_single($publication, $type, $color, $slot_css) {
+        // data-instaread-version: lets us verify the deployed plugin version on a partner
+        // site by curling any article and grepping the slot tag — no telemetry dependency.
         $slot = sprintf(
-            '<div class="instaread-player-slot" style="%s">
+            '<div class="instaread-player-slot" data-instaread-version="%s" style="%s">
                 <instaread-player publication="%s" playertype="%s" color="%s"></instaread-player>
             </div>',
+            esc_attr($this->plugin_version),
             esc_attr($slot_css),
             esc_html($publication),
             esc_html($type),
@@ -1596,7 +1733,7 @@ class InstareadPlayer {
 
     private function render_playlist($publication, $height) {
         return sprintf(
-            '<div class="instaread-player-slot" style="height:%s;min-height:%s;">
+            '<div class="instaread-player-slot" data-instaread-version="%s" style="height:%s;min-height:%s;">
                 <instaread-player publication="%s" p_type="playlist" height="%s"></instaread-player>
                 <script type="module"
                     data-cfasync="false"
@@ -1606,6 +1743,7 @@ class InstareadPlayer {
                     crossorigin="true">
                 </script>
             </div>',
+            esc_attr($this->plugin_version),
             esc_attr($height),
             esc_attr($height),
             esc_html($publication),
